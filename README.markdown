@@ -3,6 +3,9 @@ Name
 
 OpenResty - Turning Nginx into a Full-Fledged Scriptable Web Platform
 
+[demo](https://github.com/webcpp/hi_demo).
+[hi framework](https://github.com/webcpp/hi).
+
 Table of Contents
 =================
 
