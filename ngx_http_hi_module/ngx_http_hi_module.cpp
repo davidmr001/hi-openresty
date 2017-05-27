@@ -7,15 +7,17 @@ extern "C" {
 
 #include <vector>
 #include <memory>
-#include <future>
 #include "include/request.hpp"
 #include "include/response.hpp"
+#include "include/redis.hpp"
 #include "include/servlet.hpp"
+
 #include "lib/module_class.hpp"
 #include "lib/lrucache.hpp"
 #include "lib/param.hpp"
 
 
+#define SESSION_ID_NAME "SESSIONID"
 #define form_urlencoded_type "application/x-www-form-urlencoded"
 #define form_urlencoded_type_len (sizeof(form_urlencoded_type) - 1)
 
@@ -28,16 +30,21 @@ struct cache_ele_t {
 
 static std::vector<std::shared_ptr<hi::module_class<hi::servlet>>> PLUGIN;
 static std::vector<std::shared_ptr<cache::lru_cache<std::string, cache_ele_t>>> CACHE;
+static std::shared_ptr<hi::redis> REDIS;
 
 typedef struct {
     ngx_str_t module_path;
+    ngx_str_t redis_host;
+    ngx_int_t redis_port;
     ngx_int_t module_index;
     ngx_int_t cache_expires;
+    ngx_int_t session_expires;
     ngx_int_t cache_index;
     size_t cache_size;
     ngx_flag_t need_headers;
     ngx_flag_t need_cache;
     ngx_flag_t need_cookies;
+    ngx_flag_t need_session;
 } ngx_http_hi_loc_conf_t;
 
 
@@ -106,6 +113,38 @@ ngx_command_t ngx_http_hi_commands[] = {
         offsetof(ngx_http_hi_loc_conf_t, need_cookies),
         NULL
     },
+    {
+        ngx_string("hi_redis_host"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, redis_host),
+        NULL
+    },
+    {
+        ngx_string("hi_redis_port"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, redis_port),
+        NULL
+    },
+    {
+        ngx_string("hi_need_session"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_flag_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, need_session),
+        NULL
+    },
+    {
+        ngx_string("hi_session_expires"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_sec_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, session_expires),
+        NULL
+    },
     ngx_null_command
 };
 
@@ -161,12 +200,17 @@ static void * ngx_http_hi_create_loc_conf(ngx_conf_t *cf) {
         conf->module_path.len = 0;
         conf->module_path.data = NULL;
         conf->module_index = NGX_CONF_UNSET;
+        conf->redis_host.len = 0;
+        conf->redis_host.data = NULL;
+        conf->redis_port = NGX_CONF_UNSET;
         conf->cache_size = NGX_CONF_UNSET_UINT;
         conf->cache_expires = NGX_CONF_UNSET;
+        conf->session_expires = NGX_CONF_UNSET;
         conf->cache_index = NGX_CONF_UNSET;
         conf->need_headers = NGX_CONF_UNSET;
         conf->need_cache = NGX_CONF_UNSET;
         conf->need_cookies = NGX_CONF_UNSET;
+        conf->need_session = NGX_CONF_UNSET;
         return conf;
     }
     return NGX_CONF_ERROR;
@@ -177,11 +221,15 @@ static char * ngx_http_hi_merge_loc_conf(ngx_conf_t* cf, void* parent, void* chi
     ngx_http_hi_loc_conf_t * conf = (ngx_http_hi_loc_conf_t*) child;
 
     ngx_conf_merge_str_value(conf->module_path, prev->module_path, "");
+    ngx_conf_merge_str_value(conf->redis_host, prev->redis_host, "");
+    ngx_conf_merge_value(conf->redis_port, prev->redis_port, (ngx_int_t) 0);
     ngx_conf_merge_uint_value(conf->cache_size, prev->cache_size, (size_t) 10);
     ngx_conf_merge_sec_value(conf->cache_expires, prev->cache_expires, (ngx_int_t) 300);
+    ngx_conf_merge_sec_value(conf->session_expires, prev->session_expires, (ngx_int_t) 300);
     ngx_conf_merge_value(conf->need_headers, prev->need_headers, (ngx_flag_t) 0);
     ngx_conf_merge_value(conf->need_cache, prev->need_cache, (ngx_flag_t) 1);
     ngx_conf_merge_value(conf->need_cookies, prev->need_cookies, (ngx_flag_t) 0);
+    ngx_conf_merge_value(conf->need_session, prev->need_session, (ngx_flag_t) 0);
     if (conf->module_index == NGX_CONF_UNSET && conf->module_path.len > 0) {
         std::string tmp((char*) conf->module_path.data, conf->module_path.len);
         if (tmp.front() != '/') {
@@ -205,7 +253,7 @@ static char * ngx_http_hi_merge_loc_conf(ngx_conf_t* cf, void* parent, void* chi
         }
     }
 
-    if (conf->cache_index == NGX_CONF_UNSET) {
+    if (conf->need_cache == 1 && conf->cache_index == NGX_CONF_UNSET) {
         CACHE.push_back(std::make_shared<cache::lru_cache < std::string, cache_ele_t >> (conf->cache_size));
         conf->cache_index = CACHE.size() - 1;
     }
@@ -245,6 +293,7 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
 
     hi::request ngx_request;
     hi::response ngx_response;
+    std::string SESSION_ID_VALUE;
 
     ngx_request.uri.assign((char*) r->uri.data, r->uri.len);
     if (r->args.len > 0) {
@@ -309,6 +358,27 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
             }
         }
     }
+    if (conf->need_session == 1 && ngx_request.cookies.find(SESSION_ID_NAME) != ngx_request.cookies.end()) {
+        if (!REDIS) {
+            REDIS = std::make_shared<hi::redis>();
+        }
+        if (REDIS && !REDIS->is_connected() && conf->redis_host.len > 0 && conf->redis_port > 0) {
+            REDIS->connect((char*) conf->redis_host.data, (int) conf->redis_port);
+        }
+        if (REDIS && REDIS->is_connected()) {
+            SESSION_ID_VALUE = ngx_request.cookies[SESSION_ID_NAME ];
+            if (!REDIS->exists(SESSION_ID_VALUE)) {
+                REDIS->hset(SESSION_ID_VALUE, SESSION_ID_NAME, SESSION_ID_VALUE);
+                REDIS->expire(SESSION_ID_VALUE, conf->session_expires);
+                ngx_request.session[SESSION_ID_VALUE] = SESSION_ID_VALUE;
+            } else {
+                REDIS->hgetall(SESSION_ID_VALUE, ngx_request.session);
+            }
+#ifdef USE_HIREDIS
+            view_instance->REDIS = REDIS;
+#endif
+        }
+    }
 
     view_instance->handler(ngx_request, ngx_response);
     if (conf->need_cache == 1 && conf->cache_expires > 0) {
@@ -318,6 +388,9 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
         cache_v.status = ngx_response.status;
         cache_v.t = time(NULL);
         CACHE[conf->cache_index]->put(*cache_k, cache_v);
+    }
+    if (REDIS && REDIS->is_connected() && !SESSION_ID_VALUE.empty()) {
+        REDIS->hmset(SESSION_ID_VALUE, ngx_response.session);
     }
 
 done:
